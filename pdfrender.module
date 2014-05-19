@@ -1,0 +1,476 @@
+<?php
+
+/**
+ * @file
+ * Module containing functionality for an Admin to upload editable PDFs to the
+ * filesystem and specify a form field <-> content type field mapping.  The user
+ * can also place a block containing the uploaded forms so that a user
+ * can download them with their own personal content rendered on the document.
+ *
+ */
+
+// See header of fpdm.php for the modifications made to the library.
+module_load_include('php', 'pdfrender', 'lib/fpdm/fpdm');
+
+// Contains methods associated with the forms that appear on the Admin config page.
+module_load_include('inc', 'pdfrender', 'pdfrender.pages');
+
+// Helper methods for storing different field types.
+module_load_include('inc', 'pdfrender', 'pdfrender.helpers');
+
+
+/*
+ * Implements hook_help().
+ */
+function pdfrender_help($path) {
+  switch ($path) {
+    case "admin/help#pdfrender":
+      return check_markup(file_get_contents(dirname(__FILE__) . "/README.txt"));
+      break;
+  }
+}
+
+/*
+ * Implements hook_menu().
+ */
+
+function pdfrender_menu() {
+  $items = array();
+
+  // Admin interface for uploading PDF forms and saving mappings.
+  $items['admin/config/content/pdfrender'] = array(
+    'title' => 'PDF Render',
+    'description' => 'Configuration for the PDF Render module',
+    'file' => 'pdfrender.pages.inc',
+    'page callback' => 'pdfrender_form_router',
+    'type' => MENU_NORMAL_ITEM,
+    'access arguments' => array('administer site configuration'),
+  );
+
+  // Specifies callback method for a user to render content on a form they click.
+  $items['ajax/process_pdf/%/%'] = array(
+    'title' => 'Process PDF Form',
+    'page callback' => 'pdfrender_process_request',
+    'page arguments' => array(2, 3),
+    'access callback' => TRUE,
+    'access arguments' => TRUE,
+    'type' => MENU_NORMAL_ITEM,
+    // By default, any user can access this callback - might want to specify role/permission
+    // based on your use case.
+  );
+
+  // Specifies a callback an Admin can use to delete an uploaded PDF.
+  $items['ajax/delete_pdf/%'] = array(
+    'title' => 'Delete Project Sign-Off Form',
+    'page callback' => 'pdfrender_delete_pdf',
+    'page arguments' => array(2),
+    'access arguments' => array('administer site configuration'),
+    'type' => MENU_NORMAL_ITEM,
+  );
+
+  // Specifies a callback for mapping content type fields to the form fields on an uploaded PDF.
+  $items['pdfrender/ajax/%'] = array(
+    'page callback' => 'pdfrender_mapping_callback',
+    'page arguments' => array(2),
+    'access callback' => TRUE,
+    'access arguments' => array('administer site configuration'),
+    'type' => MENU_CALLBACK,
+  );
+
+  return $items;
+}
+
+/*
+ * Call back method that renders a custom mapping form based on the form
+ * fields in the passed in file.
+ */
+
+function pdfrender_mapping_callback($file) {
+  $output = drupal_render(drupal_get_form('pdfrender_custom_mapping_form', $file));
+
+  $commands[] = ajax_command_replace('#mappingform', $output);
+  $page = array('#type' => 'ajax', '#commands' => $commands);
+  ajax_deliver($page);
+}
+
+/*
+ * Implements hook_init().
+ */
+
+function pdfrender_init() {
+  drupal_add_js(drupal_get_path('module', 'pdfrender') .
+    '/js/pdfrender.js', array('scope' => 'footer'));
+  drupal_add_library('system', 'drupal.ajax');
+  drupal_add_library('system', 'jquery.form');
+}
+
+/*
+ * A user-facing block that contains a set of uploaded PDFs.
+ */
+
+function pdfrender_block_info() {
+  $blocks['pdfrender'] = array(
+    // The name that will appear in the block list.
+    'info' => t('Download PDF Forms'),
+    'cache' => DRUPAL_CACHE_PER_ROLE,
+  );
+  return $blocks;
+}
+
+/*
+ * Implements hook_block_view(). Block containing uploaded PDFs.  A user
+ * can click on the link and download a PDF with their content rendered on
+ * top based on the mapping by an Admin.
+ *
+ * ** IMPORTANT - PLEASE READ **
+ * The content rendered is based on the node id that needs to be passed on the url.
+ */
+
+function pdfrender_block_view($delta = '') {
+  switch ($delta) {
+    case 'pdfrender':
+      // Get the node id.
+      $path = explode('/', current_path());
+      $nid_to_check = array_pop($path);
+
+      if (is_numeric($nid_to_check) && node_load($nid_to_check)) {
+        $nid = $nid_to_check;
+      }
+      if (!isset($nid)) {
+        return;
+      }
+
+      $block['subject'] = t('Download PDF Forms');
+
+      $path = 'public://';
+      $existing_forms = file_scan_directory($path, '/.*.pdf$/i', array('min_depth' => 0));
+
+      $items = array();
+      foreach ($existing_forms as $pdf) {
+        $items[] = array(
+          'data' => l($pdf->name, 'ajax/process_pdf/' . $pdf->name . '.pdf/' . $nid),
+        );
+      }
+
+      if (empty($items)) {
+        $block['content'] = t('No posts available.');
+      }
+      else {
+        // Pass data through theme function.
+        $block['content'] = theme('item_list', array(
+          'items' => $items
+        ));
+      }
+
+      return $block;
+  }
+}
+
+/*
+ * Method that takes in the name of a PDF file and a node id and renders the
+ * content type data associated with the file onto the form fields
+ * and forces a download.
+ */
+
+function pdfrender_process_request($filename, $nid) {
+
+  if (isset($nid)) {
+    $node = node_load($nid);
+    // Verify the logged in user has access to this node or if they're a site administrator.
+    if (node_access('view', $node) || user_access('Administer content')) {
+      $fields = get_content_type_node_data($filename, $nid);
+      // Open up the pdf document.
+      if (!empty($filename)) {
+        $path = 'public://' . $filename;
+        $file = file_create_url($path);
+      }
+      $mapping = _get_mapping($filename, TRUE);
+      render_content_type_node_data_pdf($fields, $file, $filename, $mapping);
+      drupal_exit();
+    }
+    else {
+      // Show access denied message and redirect user to home page.
+      drupal_set_message('Access denied');
+      drupal_goto('');
+    }
+  }
+}
+
+/*
+ * Method that takes in a path to a file and removes it from file system and deletes
+ * all associations like specified mappings.
+ */
+
+function pdfrender_delete_pdf($filename) {
+  $filename = urldecode($filename);
+  $uri = 'public://' . $filename;
+
+  // Load up instance of file from uri.
+  $files = file_load_multiple(array(), array('uri' => $uri));
+  if (count($files)) {
+    $file = reset($files);
+    if ($file) {
+      drupal_unlink($file->uri);
+      file_delete($file, TRUE);
+      // Remove the mapping from the variables table as well.
+      if ($mapping = _get_mapping($filename, TRUE)) {
+        variable_del('mapping_' . $filename);
+      }
+      // Also remove the content type association.
+      $selected_content = variable_get('content_' . $filename);
+      if (isset($selected_content)) {
+        variable_del('content_' . $filename);
+      }
+    }
+  }
+
+  drupal_goto('admin/config/content/pdfrender');
+}
+
+/*
+ * Method that loads all node data into an associative
+ * array based on the given node id.
+ */
+
+function get_content_type_node_data($filename, $nid) {
+  $fields = array();
+
+  // Get the content type associated with the file.
+  $selected_content = variable_get('content_' . $filename);
+
+  if (isset($nid)) {
+    $node = node_load($nid);
+    if ($node->type == $selected_content) {
+      // The type of the node should be the same as the content type associated with the file.
+      $node_wrapper = entity_metadata_wrapper('node', $node);
+      // Fetch all the fields and corresponding data from the projects node.
+      foreach ($node_wrapper as $key => $val) {
+        if (substr($key, 0, 5) == 'field') {
+          // Process each field in the node.
+          $items = field_get_items('node', $node, $key);
+          if (!empty($items)) {
+            _process_field($key, $items, $fields);
+          }
+        }
+      }
+    }
+  }
+
+  // Fetch all possible field labels.
+  if (isset($selected_content)) {
+    $content_labels = _enumerate_all_content_labels($selected_content);
+  }
+
+  $tmp = array();
+
+  if ((is_array($content_labels)) && count($content_labels) > 0) {
+    $names = array_values($content_labels);
+
+    // Loop through the fields array and swap the machine name for the label.
+    foreach ($fields as $key => $val) {
+      if (is_array($val)) {
+        foreach ($val as $list_val) {
+          $tmp[$list_val] = $list_val;
+        }
+      }
+      else {
+        if (in_array($key, $names)) {
+          $index = array_search($key, $content_labels);
+          $tmp[$index] = $val;
+        }
+      }
+    }
+  }
+  $fields = $tmp;
+
+  // $fields now contains unique label as key and data value as value.
+  return $fields;
+}
+
+
+/*
+ * This method takes in a field and enumerates all underlying fields
+ * (machine name - value pairs) and stores them in the array based by reference.
+ */
+function _process_field($key, $current_field, &$fields) {
+  if (!empty($current_field)) {
+    foreach ($current_field as $field) {
+      $extra = field_info_field($key);
+      $type = $extra['type'];
+      $is_metadata_wrapper = FALSE;
+
+      // Call method that stores a variety of field types. Recursion triggered if field collection.
+      _process_field_type($type, $key, $field, $is_metadata_wrapper, $fields);
+    }
+  }
+}
+
+
+/*
+ * Method that takes in a field collection and recursively enumerates all
+ * possible fields within it and stores them in the array.
+ */
+function _process_field_collection($entity, &$fields) {
+  if (!empty($entity)) {
+    foreach ($entity as $key => $val) {
+      // Only process the actual fields.
+      if (substr($key, 0, 5) == 'field' && $key != 'field_name') {
+        $extra = field_info_field($key);
+        $type = $extra['type'];
+        $field_val = entity_metadata_wrapper('field_collection_item', $entity)->$key->value();
+        $is_metadata_wrapper = TRUE;
+
+        // Call method that stores a variety of field types. Recursion triggered if field collection.
+        _process_field_type($type, $key, $field_val, $is_metadata_wrapper, $fields);
+      }
+    }
+  }
+}
+
+
+/*
+ * Method that stores a machine name-value pair to the array.  Helper methods are invoked
+ * based on the type of field it is in order to properly store the key-value pair.
+ */
+function _process_field_type($field_type, $key, $field, $is_metadata_wrapper, &$fields) {
+
+  switch ($field_type) {
+    case 'field_collection':
+      if ($is_metadata_wrapper) {
+        _process_field_collection($field, $fields);
+      }
+      else {
+        $item = field_collection_field_get_entity($field);
+        if (!empty($item)) {
+          _process_field_collection($item, $fields);
+        }
+      }
+      break;
+    case 'list_text':
+      _store_field_list_text($key, $field, $is_metadata_wrapper, $fields);
+      break;
+    case 'addressfield':
+      _store_field_addressfield($key, $field, $fields);
+      break;
+    case 'list_boolean':
+      _store_field_list_boolean($key, $field, $is_metadata_wrapper, $fields);
+      break;
+    case 'taxonomy_term_reference':
+      _store_field_taxonomy_term($key, $field, $is_metadata_wrapper, $fields);
+      break;
+    case 'datetime':
+      _store_field_datetime($key, $field, $is_metadata_wrapper, $fields);
+      break;
+    default:
+      _store_field_field($key, $field, $is_metadata_wrapper, $fields);
+      break;
+  }
+
+}
+
+/*
+ * Method that retrieves all form fields that appear in a pdf.
+ */
+function _get_pdf_form_fields($file) {
+  $fpdm = new FPDM($file);
+
+  // Mechanism for getting the raw form fields from the pdf.
+  $form_fields = array();
+  $count_entries = $fpdm->parsePDFEntries($form_fields);
+  array_pop($form_fields); // Last entry is garbage.  
+  ksort($form_fields);
+  return $form_fields;
+}
+
+
+/*
+ * Method that takes in a filename and determines if a custom
+ * mapping exists for the file.
+ */
+function _get_mapping($filename, $is_ext = FALSE) {
+  if ($is_ext) {
+    $mapping = variable_get('mapping_' . $filename);
+  }
+  else {
+    $mapping = variable_get('mapping_' . $filename . '.pdf');
+  }
+
+  if (isset($mapping) && !empty($mapping)) {
+    return $mapping;
+  }
+  return FALSE;
+}
+
+/*
+ * Method that uses the FPDM library to render the given set of
+ * fields onto the PDF document supplied and force a download.
+ */
+function render_content_type_node_data_pdf($fields, $file_path, $filename, $mapping) {
+  $pdf = new FPDM($file_path);
+
+  if ($mapping) {
+    $dataset = array();
+    $keys = array_keys($fields);
+
+    foreach ($mapping as $pdf_field => $proj_value) {
+      $proj_field = array_pop($proj_value);
+      if (in_array($proj_field, $keys)) {
+        $value = $fields[$proj_field];
+        $dataset[$pdf_field] = $value;
+      }
+    }
+    $fields = $dataset;
+  }
+
+  $pdf->Load($fields, FALSE);
+  $pdf->Merge();
+  $pdf->Output($filename, 'D');
+}
+
+/*
+ * Recursive method that takes in an entity type and bundle type and retrieves
+ * all possible labels for the fields contained.
+ */
+function _get_content_type_labels($entity_type, $bundle_type, &$labels) {
+
+  $fields = field_info_instances($entity_type, $bundle_type);
+  foreach ($fields as $key => $value) {
+    $extra = field_info_field($value['field_name']);
+
+    if ($extra['type'] == 'field_collection') {
+      // If the field type is a field collection, trigger recursive call.
+      _get_content_type_labels('field_collection_item', $value['field_name'], $labels);
+    }
+    else {
+      if ($extra['type'] == 'addressfield') {
+        // Get the possible field names associated with an address.
+        if ((is_array($value)) && isset($value['default_value'][0])) {
+          $address_vals = $value['default_value'][0];
+          // We don't want the first element.
+          array_shift($address_vals);
+          foreach (array_keys($address_vals) as $address_val) {
+            $labels[$value['field_name'] . '_' . $address_val] = $value['label'] . ' ' . $address_val;
+          }
+        }
+      }
+      else {
+        $labels[$value['field_name']] = $value['label'];
+      }
+    }
+  }
+}
+
+/*
+ * Wrapper for the method that does the dirty work in fetching all labels associated
+ * with the passed in content type.
+ */
+function _enumerate_all_content_labels($content_type) {
+  $labels = array();
+
+  // Get all the labels for every field/field collection in content type..
+  _get_content_type_labels('node', $content_type, $labels);
+  $labels = array_flip($labels);
+
+  return $labels;
+}
+

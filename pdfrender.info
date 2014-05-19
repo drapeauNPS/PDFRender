@@ -1,0 +1,6 @@
+name = PDFRender
+description = A module that renders data associated with a provided content type on PDFs uploaded by an administrator.
+core = 7.x
+package = PDF Custom
+version = 7.x-1.0
+configuration = admin/config/content/pdfrender
