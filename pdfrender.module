@@ -114,6 +114,7 @@ function pdfrender_block_info() {
     'info' => t('Download PDF Forms'),
     'cache' => DRUPAL_CACHE_PER_ROLE,
   );
+  
   return $blocks;
 }
 
