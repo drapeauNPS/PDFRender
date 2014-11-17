@@ -36,6 +36,7 @@ function pdfrender_help($path) {
  */
 
 function pdfrender_menu() {
+
   $items = array();
 
   // Admin interface for uploading PDF forms and saving mappings.
